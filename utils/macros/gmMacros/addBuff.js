@@ -1,15 +1,16 @@
 // Add Buff Script Call to Open PF1e Item
+// v6: duration is taken from the buff item itself; buff field supports dropped item UUIDs.
 // v5: script-call name defaults to the open item name; hidden defaults to true.
 // v4: does NOT use pf1.components.ItemScriptCall.create.
 // It writes directly to system.scriptCalls to avoid the e.map error.
 //
-// Opens Advanced tab, asks for a buff, duration, unit, and script-call placement,
+// Opens Advanced tab, asks for a buff and script-call placement,
 // then adds a PF1e script call to the currently open item.
 //
 // Default compendium search: "Shadows over Rome - Buffs"
 //
 // Runtime public message:
-// @actor used @item. Its effect has been applied for @duration
+// @actor used @item. Its effect has been applied.
 
 const DEFAULT_COMPENDIUM = "Shadows over Rome - Buffs";
 
@@ -29,6 +30,10 @@ function esc(value) {
     .replaceAll('"', "&quot;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+function norm(value) {
+  return String(value ?? "").trim().toLowerCase();
 }
 
 function getOpenItemSheet() {
@@ -59,7 +64,7 @@ function openAdvancedTab(sheet) {
 }
 
 function localized(value) {
-  const text = String(value ?? "");
+  const text = String(value ?? "").trim();
   if (!text) return "";
   return game.i18n.localize(text) || text;
 }
@@ -75,7 +80,7 @@ function collectPlacementsFromRegistry(item) {
 
   return entries
     .map(([key, value]) => {
-      const id = value?._id ?? value?.id ?? key;
+      const id = value?.id ?? value?._id ?? key;
       const itemTypes = Array.from(value?.itemTypes ?? []);
       const label = localized(value?.name) || id;
       return { id, label, itemTypes };
@@ -101,10 +106,10 @@ function collectPlacementsFromVisibleSheet(item) {
 }
 
 function getScriptCallPlacements(item) {
-  const byId = new Map();
-
-  for (const p of collectPlacementsFromRegistry(item)) byId.set(p.id, p);
-  for (const p of collectPlacementsFromVisibleSheet(item)) byId.set(p.id, p);
+  const byId = new Map([
+    ...collectPlacementsFromRegistry(item).map(p => [p.id, p]),
+    ...collectPlacementsFromVisibleSheet(item).map(p => [p.id, p])
+  ]);
 
   if (!byId.size) {
     for (const p of FALLBACK_PLACEMENTS) {
@@ -122,20 +127,61 @@ function splitCompendia(text) {
     .filter(Boolean);
 }
 
-function buildRuntimeScript({ buffQuery, durationFormula, durationUnit, compendia }) {
+function getFormValues(html) {
+  const form = html[0].querySelector("form");
+  const data = new FormData(form);
+  const extraCompendia = data.get("addExtraCompendia") === "on"
+    ? splitCompendia(data.get("extraCompendia"))
+    : [];
+
+  return {
+    buffQuery: String(data.get("buffQuery") ?? "").trim(),
+    placement: String(data.get("placement") ?? "").trim(),
+    compendia: [DEFAULT_COMPENDIUM, ...extraCompendia]
+  };
+}
+
+function getDropData(event) {
+  const raw = event.dataTransfer?.getData("text/plain");
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function getDroppedItemUuid(data) {
+  const uuid = data?.uuid ?? data?.documentUuid;
+  if (uuid) return uuid;
+  if (data?.type !== "Item" || !data?.id) return "";
+
+  const item = await Item.fromDropData(data).catch(() => null);
+  return item?.uuid ?? "";
+}
+
+function activateBuffDrop(input) {
+  input.addEventListener("dragover", event => event.preventDefault());
+  input.addEventListener("drop", async event => {
+    event.preventDefault();
+
+    const uuid = await getDroppedItemUuid(getDropData(event));
+    if (uuid) input.value = uuid;
+  });
+}
+
+function buildRuntimeScript({ buffQuery, compendia }) {
   return `
 (async () => {
-  const BUFF_QUERY = ${JSON.stringify(buffQuery)};
-  const DURATION_FORMULA = ${JSON.stringify(durationFormula)};
-  const DURATION_UNIT = ${JSON.stringify(durationUnit)};
-  const COMPENDIA = ${JSON.stringify(compendia)};
+  const BUFF_REF = ${JSON.stringify(buffQuery)};
+  const COMPENDIA = new Set(${JSON.stringify(compendia.map(norm))});
 
-  function html(value) {
-    return String(value ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;");
-  }
+  const norm = value => String(value ?? "").trim().toLowerCase();
+  const html = value => String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 
   function getSourceItem() {
     if (typeof item !== "undefined" && item) return item;
@@ -145,45 +191,46 @@ function buildRuntimeScript({ buffQuery, durationFormula, durationUnit, compendi
   }
 
   function getTargetActor(sourceItem) {
-    // Preferred behavior: use the player's assigned character first.
-    if (game.user.character) return game.user.character;
-
-    // Then fall back to the actor owning the item.
     if (sourceItem?.actor) return sourceItem.actor;
-
     if (typeof actor !== "undefined" && actor) return actor;
     if (typeof shared !== "undefined" && shared?.actor) return shared.actor;
-
-    return canvas.tokens.controlled[0]?.actor ?? null;
+    return canvas.tokens.controlled[0]?.actor ?? game.user.character ?? null;
   }
 
-  async function findBuff(query) {
-    const direct = await fromUuid(query).catch(() => null);
-    if (direct) return direct;
+  function parseRef(query) {
+    const text = String(query ?? "").trim();
+    const match = text.match(/@UUID\\[([^\\]]+)\\]/);
+    return match?.[1] ?? text;
+  }
 
-    const wanted = String(query ?? "").trim().toLowerCase();
+  function findOwnedBuff(actor, name) {
+    const wanted = norm(name);
+    if (!wanted) return null;
+    return actor.items.find(i => i.type === "buff" && norm(i.name) === wanted) ?? null;
+  }
+
+  async function findBuffTemplate(ref) {
+    const parsedRef = parseRef(ref);
+    const direct = await fromUuid(parsedRef).catch(() => null);
+
+    if (direct?.documentName === "Item" && direct.type === "buff") return direct;
+
+    const wanted = norm(parsedRef);
+    if (!wanted) return null;
 
     for (const pack of game.packs) {
       if (pack.documentName !== "Item") continue;
 
-      const labels = [
+      const labels = new Set([
         pack.collection,
         pack.metadata?.label,
         pack.title
-      ].map(v => String(v ?? "").trim()).filter(Boolean);
+      ].map(norm).filter(Boolean));
 
-      const matchesCompendium = labels.some(label =>
-        COMPENDIA.some(c => label.toLowerCase() === c.toLowerCase())
-      );
-
-      if (!matchesCompendium) continue;
+      if (![...labels].some(label => COMPENDIA.has(label))) continue;
 
       const index = await pack.getIndex({ fields: ["name", "type"] });
-
-      const hit = index.find(e =>
-        String(e.name ?? "").trim().toLowerCase() === wanted &&
-        (!e.type || e.type === "buff")
-      );
+      const hit = index.find(e => norm(e.name) === wanted && (!e.type || e.type === "buff"));
 
       if (hit) return await pack.getDocument(hit._id);
     }
@@ -191,45 +238,23 @@ function buildRuntimeScript({ buffQuery, durationFormula, durationUnit, compendi
     return null;
   }
 
-  async function rollDuration(actor, sourceItem) {
-    const formula = String(DURATION_FORMULA || "1").trim();
-
-    if (/^\\d+$/.test(formula)) {
-      return Math.max(0, Math.floor(Number(formula) || 0));
-    }
-
-    const rollData = actor?.getRollData?.() ?? {};
-    rollData.item = sourceItem?.getRollData?.() ?? sourceItem?.system ?? {};
-
-    const roll = await new Roll(formula, rollData).evaluate({ async: true });
-    return Math.max(0, Math.floor(Number(roll.total) || 0));
+  async function createBuff(actor, template) {
+    const data = template.toObject();
+    data.system ??= {};
+    data.system.active = true;
+    data.system.disabled = false;
+    return (await actor.createEmbeddedDocuments("Item", [data]))[0] ?? null;
   }
 
-  async function activateBuff(buff, durationValue) {
-    // IMPORTANT:
-    // PF1e expects duration.value to be a roll formula/string.
-    // Do NOT save it as a number, or ItemBuffPF will crash during prepareData.
-    const durationString = String(durationValue ?? 0);
+  async function activateBuff(buff) {
+    if (typeof buff.setActive === "function") {
+      await buff.setActive(true).catch(() => null);
+    }
 
-    const updateData = {
-      "system.duration.value": durationString,
-      "system.duration.units": DURATION_UNIT,
-      "system.active": true,
-      "system.disabled": false
-    };
-
-    await buff.update(updateData).catch(async err => {
-      console.warn("Buff duration update failed, trying activation-only update.", err);
-
+    if (buff.system?.active !== true || buff.system?.disabled !== false) {
       await buff.update({
         "system.active": true,
         "system.disabled": false
-      });
-    });
-
-    if (typeof buff.setActive === "function") {
-      await buff.setActive(true).catch(err => {
-        console.warn("buff.setActive(true) failed.", err);
       });
     }
   }
@@ -242,55 +267,36 @@ function buildRuntimeScript({ buffQuery, durationFormula, durationUnit, compendi
     return;
   }
 
-  const sourceItemName = sourceItem?.name ?? "Unknown Item";
-  const buffTemplate = await findBuff(BUFF_QUERY);
+  let buff = findOwnedBuff(targetActor, parseRef(BUFF_REF));
 
-  if (!buffTemplate) {
-    ui.notifications.warn(\`Buff not found: \${BUFF_QUERY}\`);
+  if (!buff) {
+    const template = await findBuffTemplate(BUFF_REF);
+
+    if (!template) {
+      ui.notifications.warn(\`Buff not found: \${BUFF_REF}\`);
+      return;
+    }
+
+    buff = findOwnedBuff(targetActor, template.name) ?? await createBuff(targetActor, template);
+  }
+
+  if (!buff) {
+    ui.notifications.warn(\`Could not apply buff: \${BUFF_REF}\`);
     return;
   }
 
-  const durationValue = await rollDuration(targetActor, sourceItem);
-  const durationString = String(durationValue ?? 0);
-
-  const wantedName = buffTemplate.name.trim().toLowerCase();
-
-  let appliedBuff = targetActor.items.find(i =>
-    i.type === "buff" &&
-    i.name.trim().toLowerCase() === wantedName
-  );
-
-  if (!appliedBuff) {
-    const data = buffTemplate.toObject();
-
-    data.system ??= {};
-    data.system.duration ??= {};
-
-    // IMPORTANT: string, not number.
-    data.system.duration.value = durationString;
-    data.system.duration.units = DURATION_UNIT;
-    data.system.active = true;
-    data.system.disabled = false;
-
-    const created = await targetActor.createEmbeddedDocuments("Item", [data]);
-    appliedBuff = created[0];
-  }
-
-  await activateBuff(appliedBuff, durationString);
-
-  const durationText = \`\${durationString} \${DURATION_UNIT}\`;
+  await activateBuff(buff);
 
   await ChatMessage.create({
     speaker: ChatMessage.getSpeaker({ actor: targetActor }),
-    content: \`<strong>\${html(targetActor.name)}</strong> used \${html(sourceItemName)}. Its effect has been applied for \${html(durationText)}.\`
+    content: \`<strong>\${html(targetActor.name)}</strong> used \${html(sourceItem?.name ?? "Unknown Item")}. Its effect has been applied.\`
   });
 })();
 `.trim();
 }
 
 async function addScriptCall(item, callData) {
-  const source = item.toObject();
-  const current = foundry.utils.deepClone(source.system?.scriptCalls ?? []);
+  const current = foundry.utils.deepClone(item.system?.scriptCalls ?? []);
 
   current.push({
     _id: foundry.utils.randomID(16),
@@ -331,22 +337,9 @@ new Dialog({
       <div class="form-group">
         <label>Buff name or UUID</label>
         <input type="text" name="buffQuery" value="${esc(item.name)}" required>
-      </div>
-
-      <div class="form-group">
-        <label>Duration formula</label>
-        <input type="text" name="durationFormula" value="1" required>
-      </div>
-
-      <div class="form-group">
-        <label>Duration unit</label>
-        <select name="durationUnit">
-          <option value="round">round</option>
-          <option value="minute">minute</option>
-          <option value="hour">hour</option>
-          <option value="day">day</option>
-          <option value="perm">perm</option>
-        </select>
+        <p style="font-size: 12px; opacity: 0.75;">
+          Drag a buff item here to use its UUID, or keep the exact buff name.
+        </p>
       </div>
 
       <div class="form-group">
@@ -379,26 +372,13 @@ new Dialog({
       icon: '<i class="fas fa-save"></i>',
       label: "Add Script Call",
       callback: async html => {
-        const form = html[0].querySelector("form");
-        const data = new FormData(form);
-
-        const buffQuery = String(data.get("buffQuery") ?? "").trim();
-        const durationFormula = String(data.get("durationFormula") ?? "1").trim();
-        const durationUnit = String(data.get("durationUnit") ?? "round").trim();
-        const placement = String(data.get("placement") ?? "").trim();
-
-        const addExtra = data.get("addExtraCompendia") === "on";
-        const extraCompendia = addExtra ? splitCompendia(data.get("extraCompendia")) : [];
-        const compendia = [DEFAULT_COMPENDIUM, ...extraCompendia];
+        const { buffQuery, placement, compendia } = getFormValues(html);
 
         if (!buffQuery) return ui.notifications.warn("Insert the buff name or UUID.");
-        if (!durationFormula) return ui.notifications.warn("Insert a duration formula.");
         if (!placement) return ui.notifications.warn("Select a script-call placement.");
 
         const script = buildRuntimeScript({
           buffQuery,
-          durationFormula,
-          durationUnit,
           compendia
         });
 
@@ -421,5 +401,9 @@ new Dialog({
       label: "Cancel"
     }
   },
-  default: "add"
+  default: "add",
+  render: html => {
+    const input = html[0]?.querySelector?.('input[name="buffQuery"]');
+    if (input) activateBuffDrop(input);
+  }
 }).render(true);
