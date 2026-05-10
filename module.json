@@ -1,0 +1,37 @@
+{
+  "id": "pf1e-shadows-over-rome",
+  "type": "module",
+  "title": "PF1e Shadows Over Rome",
+  "description": "Custom module for the Shadows Over Rome campaign for Pathfinder 1e.",
+  "version": "1.0.0",
+  "compatibility": {
+    "minimum": "12",
+    "verified": "13"
+  },
+  "authors": [
+    {
+      "name": "Wazard"
+    }
+  ],
+  "esmodules": [
+    "scripts/weapon-group-bonuses.js",
+    "scripts/delayed-buffs.js",
+    "scripts/hide-buffs-from-players.js",
+    "scripts/sor-on-roll-weapon-effects.js",
+    "scripts/sor-true-blind-rolls.js",
+    "scripts/sor-on-hp-change.js",
+    "scripts/modular-consume-on-next-roll-buffs.js"
+  ],
+  "relationships": {
+    "systems": [
+      {
+        "id": "pf1",
+        "type": "system",
+        "compatibility": {
+          "minimum": "11.0",
+          "verified": "11.11"
+        }
+      }
+    ]
+  }
+}
